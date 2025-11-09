@@ -1,14 +1,4 @@
-"""
-SB3-faithful PPO (clip) — multiprocessing trainer
-Matches Stable-Baselines3 math and semantics,
-but keeps your fast parallel rollout system.
-
-Fixes:
-- Single pygame warning (not per-worker)
-- Faster iteration via persistent multiprocessing
-- Realistic per-iteration reward std
-"""
-
+## <dense_scripts/PPO/ppo.py>
 import os
 import time
 import warnings
@@ -539,32 +529,47 @@ class PPOTrainer:
         self.writer.add_scalar("time/iter_sec", it_time, s)
 
     def _record_videos(self, video_dir, episodes, fps, fmt):
-        out_dir = (
-            Path(video_dir) / f"G{self.cfg.G}_γ{self.cfg.gamma}_{self.timestamp}"
-        )
+        out_dir = Path(video_dir) / f"ppo_G{self.cfg.G}_γ{self.cfg.gamma}_{self.timestamp}"
         out_dir.mkdir(parents=True, exist_ok=True)
-        print(f"🎥 Recording videos to {out_dir}")
-        
-        # ✅ MODIFIED: Pass self.env_spec and self.cfg.T
+        print(f"🎥 Recording PPO evaluation videos to {out_dir}")
+
+        if record_videos is None:
+            print("⚠️ 'record_videos' utility not available; skipping video recording.")
+            return
+
         record_videos(
             self.pi,
-            self.env_spec,  # Use the spec
+            self.env_spec,
             video_dir=out_dir,
             episodes=episodes,
             fps=fps,
             device=self.device,
             out_format=fmt,
-            T=self.cfg.T,  # Pass max steps
+            T=self.cfg.T,
         )
 
-        # ✅ ADDED: Save hyperparams to the video directory
+        # Save run metadata
         txt_path = out_dir / f"ppo_{self.timestamp}.txt"
         with open(txt_path, "w") as f:
-            f.write("=== PPO Hyperparameters (SB3-faithful) ===\n")
+            f.write("=== PPO Run Parameters (Video Export) ===\n")
             for k, v in vars(self.cfg).items():
                 if k != "env":
                     f.write(f"{k:20s}: {v}\n")
             f.write(f"{'env_id':20s}: {self.env_id_str}\n")
             f.write(f"{'device':20s}: {self.device}\n")
             f.write(f"{'video_dir':20s}: {out_dir}\n")
-        print(f"📝 Saved video run params to {txt_path}")
+        print(f"📝 Saved video parameters to {txt_path}")
+
+
+    def _save_hparams(self):
+        txt_path = self.run_dir / f"ppo_{self.timestamp}.txt"
+        with open(txt_path, "w") as f:
+            f.write("=== PPO Hyperparameters (GRPO-style log format) ===\n")
+            for k, v in vars(self.cfg).items():
+                if k != "env":  # env may be object
+                    f.write(f"{k:20s}: {v}\n")
+            f.write(f"{'env_id':20s}: {self.env_id_str}\n")
+            f.write(f"{'device':20s}: {self.device}\n")
+            f.write(f"{'timestamp':20s}: {self.timestamp}\n")
+            f.write(f"{'run_dir':20s}: {self.run_dir}\n")
+        print(f"📝 Saved hyperparameters to {txt_path}")

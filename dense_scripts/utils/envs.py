@@ -1,7 +1,7 @@
 # <dense_script/utils/envs.py>
 import math
 
-
+from typing import Optional, Dict, Any, Tuple, List, Type, Union
 import gymnasium as gym
 from gymnasium.envs.box2d.lunar_lander import LunarLander
 import numpy as np
@@ -392,3 +392,68 @@ class DenseLunarLander(LunarLander):
             )
 
         return obs, reward, terminated, truncated, info
+
+
+
+class StatefulLunarLander(DenseLunarLander):
+    """
+    A wrapper around DenseLunarLander that adds `get_state()` and `set_state()` methods.
+    
+    This is CRITICAL for Monte Carlo search algorithms, as it allows the
+    environment to be "rewound" to a previous state to explore different actions.
+    """
+    
+    def get_state(self) -> Tuple[Any, Any, Any]:
+        """
+        Saves the full physical and logical state of the environment.
+        """
+        # 1. Save physics state for all dynamic bodies
+        lander_state = (
+            self.lander.position.copy(),
+            self.lander.angle,
+            self.lander.linearVelocity.copy(),
+            self.lander.angularVelocity
+        )
+        legs_state = [
+            (leg.position.copy(), leg.angle, leg.linearVelocity.copy(), leg.angularVelocity)
+            for leg in self.legs
+        ]
+        
+        # 2. Save game logic state
+        game_state = (
+            self.game_over,
+            self.prev_shaping,
+            # Save wind state (if used)
+            getattr(self, 'wind_idx', 0),
+            getattr(self, 'torque_idx', 0)
+        )
+        return (lander_state, legs_state, game_state)
+
+    def set_state(self, state: Tuple[Any, Any, Any]):
+        """
+        Restores the full physical and logical state of the environment.
+        """
+        lander_state, legs_state, game_state = state
+        
+        # 1. Restore physics state
+        pos, angle, lin_vel, ang_vel = lander_state
+        self.lander.position = pos
+        self.lander.angle = angle
+        self.lander.linearVelocity = lin_vel
+        self.lander.angularVelocity = ang_vel
+        self.lander.awake = True # Wake up the body
+
+        for i, leg_state in enumerate(legs_state):
+            pos, angle, lin_vel, ang_vel = leg_state
+            self.legs[i].position = pos
+            self.legs[i].angle = angle
+            self.legs[i].linearVelocity = lin_vel
+            self.legs[i].angularVelocity = ang_vel
+            self.legs[i].awake = True
+
+        # 2. Restore game logic state
+        (self.game_over, self.prev_shaping, 
+         wind_idx, torque_idx) = game_state
+        
+        self.wind_idx = wind_idx
+        self.torque_idx = torque_idx

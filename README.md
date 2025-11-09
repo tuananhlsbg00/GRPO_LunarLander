@@ -140,11 +140,10 @@ You will need to have your policy classes (e.g., `ActorCriticPolicy`, `SimpleGRP
 This example uses the `PPOTrainer` with GAE. It's the standard, robust choice for `LunarLander`.
 
 ```python
-import torch
 # PPO needs an Actor-Critic policy (or any policy with .dist() and .value() methods)
-from dense_scripts.utils.policies import ActorCriticPolicy 
-from dense_scripts.PPO.ppo import PPOTrainer, PPOConfig
-from dense_scripts.utils.envs import DenseLunarLander
+from dense_scripts.utils import SimpleActorCriticPolicy 
+from dense_scripts.PPO import PPOTrainer, PPOConfig
+from dense_scripts.utils import DenseLunarLander
 
 # 1. Initialize environments
 env_train = DenseLunarLander(randomize_angle=True, randomize_pos=True)
@@ -153,7 +152,7 @@ env_eval = DenseLunarLander(randomize_angle=False, randomize_pos=False)
 # 2. Initialize the Policy
 # The PPOTrainer will automatically create its own ValueNet, 
 # but it's cleaner to use a combined ActorCriticPolicy.
-policy = ActorCriticPolicy(env_train.observation_space.shape[0], env_train.action_space.n)
+policy = SimpleActorCriticPolicy(env_train.observation_space.shape[0], env_train.action_space.n)
 
 # 3. Configure the Trainer
 cfg = PPOConfig(
