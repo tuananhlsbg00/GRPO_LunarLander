@@ -3,7 +3,7 @@
 This repository provides high-performance, multiprocessing-based implementations of two key policy-gradient algorithms in PyTorch:
 
 1.  **`PPOTrainer`**: A standard Actor-Critic **Proximal Policy Optimization (PPO)** trainer that is faithful to the design of Stable-Baselines3 (SB3). It uses **Generalized Advantage Estimation (GAE)** and is ideal for standard single-agent RL problems.
-2.  **`GRPOTrainer`**: A flexible, Actor-Only **Group Reward Policy Optimization (GRPO)** trainer inspired by recent advancements in large-scale model optimization (like the [DeepSeek-RL paper](https://arxiv.org/abs/2405.04517)). This trainer is designed for experiments with batch-level advantage calculations and comes in three variations.
+2.  **`GRPOTrainer`**: A flexible, Actor-Only **Group Reward Policy Optimization (GRPO)** trainer inspired by recent advancements in large-scale model optimization (like the [DeepSeek-Math paper](https://arxiv.org/pdf/2402.03300)). This trainer is designed for experiments with batch-level advantage calculations and comes in three variations.
 
 The core of this repository is a fast, `fork`-safe multiprocessing system that farms out rollouts to CPU workers, keeping the main process free for GPU-based optimization.
 
@@ -26,7 +26,7 @@ The core of this repository is a fast, `fork`-safe multiprocessing system that f
 
 1.  Clone the repository:
     ```bash
-    git clone [https://github.com/your-username/your-repo-name.git](https://github.com/your-username/your-repo-name.git)
+    git clone [https://github.com/tuananhlsbg00/GRPO_LunarLander.git](https://github.com/tuananhlsbg00/GRPO_LunarLander.git)
     cd your-repo-name
     ```
 
