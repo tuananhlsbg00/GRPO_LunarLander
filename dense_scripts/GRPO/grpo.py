@@ -192,7 +192,7 @@ def compute_hybrid_advantages(episodes: List[Dict[str, list]],
         -1.0
     ).astype(np.float32)
 
-    mag = (np.abs(A_ep)[:, None] * alpha) * (np.abs(A_step) * beta)
+    mag = (np.abs(A_ep)[:, None] ** alpha) * (np.abs(A_step) ** beta)
     A_hybrid = sign_mat * mag
     A_hybrid *= M
 
