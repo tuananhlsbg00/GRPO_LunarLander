@@ -1,0 +1,39 @@
+# Ignore system / editor files
+.DS_Store
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.swp
+
+# Ignore environment and config
+.env
+.venv/
+*.egg-info/
+.idea/
+.vscode/
+*.log
+
+# Ignore all outputs
+runs/
+videos/
+output/
+checkpoints/
+*.mp4
+*.avi
+*.gif
+*.png
+*.jpg
+
+# Ignore large data artifacts
+*.npy
+*.npz
+*.pt
+*.pth
+*.ckpt
+
+# Ignore TensorBoard logs
+events.out.tfevents.*
+
+# Ignore notebook checkpoints
+.ipynb_checkpoints/
