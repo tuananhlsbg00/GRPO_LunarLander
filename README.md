@@ -311,3 +311,13 @@ trainer.train(
     video_episodes=10
 )
 ```
+
+## Sparse Scripts (Sparse Lunar Lander)
+- **What it is**: The `sparse_scripts` package mirrors the PPO and GRPO tooling but targets the sparse-reward variant of Lunar Lander defined in `sparse_scripts/utils/sparse_lunar_lander.py`. It exposes an `EnvConfig` dataclass that lets you toggle soft landings, spawn randomization, and reward shaping penalties without touching the trainer code.
+- **Why it exists**: Sparse rewards make landing substantially harder; the helpers in `sparse_scripts/utils/train_compare_sparse_lander.py` orchestrate side-by-side GRPO vs PPO runs, track success rates, and persist learning curves, CSV summaries, and Matplotlib figures under `runs/<run_id>/`.
+- **How evaluation works**: `sparse_scripts/utils/evaluate_models.py` reloads saved checkpoints, replays them for configurable numbers of episodes, captures crash analytics, and can export comparison plots or MP4 rollouts (requires `imageio`).
+- **Quick start**:
+    1. Edit `compareFT.py` (or author a new script) to set up an `EnvConfig`, `TrainingComparisonConfig`, and optional `EvaluationConfig` pointing at your output directory.
+    2. Launch training with `python compareFT.py` to produce PPO and GRPO runs plus evaluation metrics.
+    3. Inspect `runs/<run_id>/` for logs, best-model checkpoints (`models/ppo_*`, `models/grpo_*`), and aggregated CSV/plot outputs.
+- **Dependencies**: Beyond the base trainers, sparse experiments rely on `matplotlib`, `pandas`, `seaborn`, and optionally `imageio[ffmpeg]` for video exports—install them via `pip install matplotlib pandas seaborn imageio imageio-ffmpeg` before running the scripts.
