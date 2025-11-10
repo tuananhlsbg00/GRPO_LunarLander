@@ -267,7 +267,7 @@ class PPOTrainer:
         # ✅ ADDED: Set fork method like GRPO for clean startup
         if mp.get_start_method(allow_none=True) != "fork":
             try:
-                mp.set_start_method("fork", force=True)
+                mp.set_start_method("spawn", force=True)
             except RuntimeError:
                 pass  # Can't set start method more than once
 

@@ -14,6 +14,7 @@ from torch.distributions.kl import kl_divergence
 from torch.utils.tensorboard import SummaryWriter
 from datetime import datetime
 from dense_scripts.utils.tools import record_videos, evaluate_model, make_env_from_spec, env_to_spec
+from dense_scripts.utils import StatefulLunarLander
 from tqdm.auto import tqdm
 
 torch.set_num_threads(1)  # keep workers lean
@@ -47,6 +48,14 @@ def _rollout_worker(env_spec: EnvSpec,
     policy.load_state_dict({k: v.cpu() for k, v in state_dict.items()})
     policy.eval()
 
+    # Make sure torch randomness differs per process
+    if seed is not None:
+        # Mix global seed with process ID to decorrelate RNG streams
+        torch_seed = (seed + os.getpid()) % (2**31 - 1)
+    else:
+        torch_seed = int.from_bytes(os.urandom(4), "little")
+    torch.manual_seed(torch_seed)
+    
     # Call reset() ONCE and pass the seed to it
     s, _ = env.reset(seed=seed)
     ep = {"s": [], "a": [], "logp": [], "r": [], "done": [], "s_next": []}
@@ -207,6 +216,83 @@ def compute_hybrid_advantages(episodes: List[Dict[str, list]],
 
     return A_hybrid * M
 
+
+treesearch_worker_globals = {
+    "policy_class": None,
+    "policy_kwargs": None,
+    "env_spec": None,
+    "worker_envs": {} # Dict[worker_id, StatefulLunarLander]
+}
+
+def _treesearch_init_worker(env_spec: EnvSpec, 
+                            policy_class: Type[nn.Module], 
+                            policy_kwargs: Dict[str, Any],
+                            master_seed: int):
+    """Initializes a persistent, seeded environment for each TreeSearch worker."""
+    global treesearch_worker_globals
+    
+    # Get the worker's unique pool index (0, 1, 2, ...)
+    worker_id = mp.current_process()._identity[0] - 1 
+
+    treesearch_worker_globals["policy_class"] = policy_class
+    treesearch_worker_globals["policy_kwargs"] = policy_kwargs
+    treesearch_worker_globals["env_spec"] = env_spec
+    
+    env = make_env_from_spec(env_spec)
+    if not isinstance(env, StatefulLunarLander):
+        raise TypeError(f"TreeSearchGRPOTrainer requires a StatefulLunarLander, but got {type(env)}")
+    
+    # IMPORTANT: Reset with the master seed so all workers share the same terrain
+    env.reset(seed=master_seed) 
+    
+    # Use the worker's index as the key
+    treesearch_worker_globals["worker_envs"][worker_id] = env
+    
+def _treesearch_rollout_worker(
+    env_state: Tuple, 
+    action: int, 
+    policy_state_dict: Dict, 
+    n_steps: int, 
+    gamma: float
+) -> float:
+    """
+    Worker function. Restores state, takes one action, rolls out N steps.
+    Returns the total discounted return from that action.
+    """
+    global treesearch_worker_globals
+    # worker_id, env_state, action, policy_state_dict, n_steps, gamma = args
+
+    worker_id = mp.current_process()._identity[0] - 1
+
+    env = treesearch_worker_globals["worker_envs"][worker_id]
+    
+    obs_dim = env.observation_space.shape[0]
+    act_dim = env.action_space.n
+    policy = treesearch_worker_globals["policy_class"](obs_dim, act_dim, **treesearch_worker_globals["policy_kwargs"])
+    policy.load_state_dict(policy_state_dict)
+    policy.eval()
+
+    env.set_state(env_state)
+    
+    s_prime, r_0, term, trunc, _ = env.step(action)
+    
+    total_return = float(r_0)
+    discount = float(gamma)
+
+    for _ in range(n_steps):
+        if term or trunc:
+            break
+            
+        with torch.no_grad():
+            s_t = torch.tensor(s_prime, dtype=torch.float32).unsqueeze(0)
+            a = policy.dist(s_t).sample().item()
+            
+        s_prime, r, term, trunc, _ = env.step(a)
+        
+        total_return += discount * r
+        discount *= gamma
+
+    return total_return
 
 def flatten_batch(episodes: List[Dict[str, list]], A: np.ndarray):
     """Flatten (S, A, LOGP_OLD, ADV) aligned to per-step advantages."""
@@ -485,11 +571,21 @@ class GRPOBaseTrainer:
 
         # --- optional video recording ---
         if video_dir is not None:
+            
             video_path = (Path(video_dir) / f"{self._trainer_name.lower()}_G{self.cfg.G}_{self.timestamp}")
             print(f"🎥 Saving videos to {video_path}")
+
+            # --- choose environment for video recording ---
+            if eval_env is not None:
+                video_env = eval_env
+            elif hasattr(self.cfg, "env") and hasattr(self.cfg.env, "reset"):
+                video_env = self.cfg.env
+            else:
+                video_env = self.env_spec  # fallback to spec (string or tuple)
+            
             record_videos(
                 policy=self.pi,
-                env=self.env_spec,
+                env=video_env,
                 video_dir=video_path,
                 episodes=video_episodes,
                 fps=video_fps,
@@ -497,6 +593,7 @@ class GRPOBaseTrainer:
                 out_format=video_format,
                 T=self.cfg.T
             )
+
             txt_path = video_path / f"grpo_config_{self.timestamp}.txt"
             video_path.mkdir(parents=True, exist_ok=True)
             with open(txt_path, "w") as f:
@@ -601,116 +698,78 @@ class HybridAdvGRPOTrainer(GRPOBaseTrainer):
 
 
 
+# --- Config for TreeSearch Trainer ---
 @dataclass
-class TreeSearchGRPOConfig:
-    env_spec = "LunarLander-v3"
+class TreeSearchGRPOConfig(GRPOConfig):
+    # Inherit all fields from GRPOConfig
+    
+    # Add new MCTS-specific parameters
     n_rollout_steps: int = 100 # N-step return to estimate Q(s,a)
-    gamma: float = 0.99
-    lr: float = 3e-4
-    clip_eps: float = 0.2
-    ent_coef: float = 0.01
-    max_grad_norm: float = 0.5
-    G: int = 32      # Number of actions to sample at each step
-    epochs: int = 4  # Optimization epochs per *timestep*
-    minibatches: int = 4 # Minibatches for the G samples
-    n_workers: Optional[int] = None
-    target_kl: float = 0.015
-    beta_kl: float = 0.02
-    kl_adjust_up: float = 1.5
-    kl_adjust_down: float = 1 / 1.5
-    log_dir: str = "./runs/MCTS_GRPO"
-    seed: Optional[int] = None
-    verbose: int = 1
-    ref_update_freq: int = 1 # In *policy updates* (timesteps)
+    
+    # Override defaults from GRPOConfig
+    log_dir: str = "./runs/TreeSearchGRPO"
+    identical_G: bool = True # MCTS *requires* identical G
+    minibatches: int = 4 # Default for smaller (G,) batches
+    T: int = 1000 # Default max steps for video recording
 
-class TreeSearchGRPOTrainer:
+class TreeSearchGRPOTrainer(GRPOBaseTrainer):
     """
     Monte Carlo Tree Search (MCTS) style GRPO Trainer.
-    
-    At each step of an episode, this trainer:
-    1. Samples G actions from the policy.
-    2. Runs G parallel N-step rollouts to estimate Q(s, a) for each action.
-    3. Normalizes these Q-values to get advantages.
-    4. Updates the policy on this (s, a_i, adv_i) batch.
-    5. Takes the action with the highest estimated Q-value in the real env.
-    
-    This is an ONLINE, step-by-step algorithm and is FUNDAMENTALLY DIFFERENT
-    from the batch-based GRPO trainers above. It requires a Stateful environment.
+    Inherits from GRPOBaseTrainer to reuse init, logging, and update logic.
+    Overrides the main `train` loop to be step-by-step (online).
     """
-    _trainer_name = "MCTS"
+    _trainer_name = "TreeSearch"
 
     def __init__(self, policy: nn.Module,
                  config: Optional[TreeSearchGRPOConfig] = None,
                  device: Optional[str] = None):
         
-        self.cfg = config or MCTS_GRPOConfig()
-        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        if config is None:
+            config = TreeSearchGRPOConfig()
+        if not isinstance(config, TreeSearchGRPOConfig):
+            raise TypeError(f"TreeSearchGRPOTrainer requires a TreeSearchGRPOConfig")
+            
+        # Call parent __init__ to set up policy, optim, logging, etc.
+        # We pass the env_spec from the config, which is `env` in the base config
+        super().__init__(policy, config, device)
 
-        base_seed = self.cfg.seed or int(time.time())
-        self.np_random = np.random.default_rng(base_seed)
-        # Master seed for env terrain
-        self.master_seed = int(self.np_random.integers(2**31 - 1)) 
-
-        self.env_spec, self.env_id_str = env_to_spec(self.cfg.env_spec)
+        if not self.cfg.identical_G:
+            print(f"\n{'='*20} WARNING {'='*20}")
+            print(f"TreeSearchGRPOTrainer requires identical_G=True to ensure all")
+            print(f"workers share the same environment state (terrain).")
+            print(f"Forcing identical_G=True.")
+            print(f"{'='*50}\n")
+            self.cfg.identical_G = True
         
+        # Create the main environment for stepping
         self.main_env = make_env_from_spec(self.env_spec)
         if not isinstance(self.main_env, StatefulLunarLander):
-             raise TypeError(f"MCTS_GRPOTrainer requires a StatefulLunarLander, but got {type(self.main_env)}")
-        self.main_env.reset(seed=self.master_seed) # Set terrain
-
-        self.obs_dim = self.main_env.observation_space.shape[0]
-        self.act_dim = self.main_env.action_space.n
-
-        self.policy_class = policy.__class__
-        self.policy_kwargs = getattr(policy, "_init_kwargs", {}) if hasattr(policy, "_init_kwargs") else {}
-        self.pi = self.policy_class(self.obs_dim, self.act_dim, **self.policy_kwargs).to(self.device)
-        self.pi.load_state_dict(policy.state_dict())
-        self.pi_ref = self.policy_class(self.obs_dim, self.act_dim, **self.policy_kwargs).to(self.device)
-        self.pi_ref.load_state_dict(policy.state_dict())
-        self.opt = optim.Adam(self.pi.parameters(), lr=self.cfg.lr)
-
-        now = datetime.now()
-        self.timestamp = f"{now.hour:02d}h{now.minute:02d}_{now.day:02d}{now.month:02d}{now.year}"
-        self.run_dir = Path(self.cfg.log_dir) / f"mcts_grpo_{self.timestamp}"
-        self.run_dir.mkdir(parents=True, exist_ok=True)
-        self.writer = SummaryWriter(self.run_dir)
-        self._save_hparams()
-
-        self.global_steps = 0
-        self.start_time = time.time()
-
-        if self.cfg.n_workers is None:
-            self.cfg.n_workers = min(self.cfg.G, os.cpu_count() or 1)
+             raise TypeError(f"TreeSearchGRPOTrainer requires a StatefulLunarLander, but got {type(self.main_env)}")
         
-        if mp.get_start_method(allow_none=True) != "fork":
-            try:
-                mp.set_start_method("fork", force=True)
-            except RuntimeError:
-                pass
+        # Close the pool created by the parent
+        # self.pool.close()
+        # self.pool.join()
+        self.master_seed = int(self.np_random.integers(2**31 - 1))
+
+        # This is now a SINGLE tuple of shared arguments
+        init_args_tuple = (
+            self.env_spec, 
+            self.policy_class, 
+            self.policy_kwargs, 
+            self.master_seed
+        )
         
-        # Pass the master seed to all workers so they create identical terrain
-        init_args_list = [
-            (i, self.env_spec, self.policy_class, self.policy_kwargs, self.master_seed) 
-            for i in range(self.cfg.n_workers)
-        ]
+        # Pass the single tuple to initargs
         self.pool = mp.Pool(processes=self.cfg.n_workers, 
-                            initializer=_mcts_init_worker, 
-                            initargs=[args for args in init_args_list])
+                            initializer=_treesearch_init_worker, 
+                            initargs=init_args_tuple)
         
-    def _save_hparams(self):
-        txt_path = self.run_dir / f"mcts_grpo_config_{self.timestamp}.txt"
-        with open(txt_path, "w") as f:
-            f.write(f"=== GRPO ({self._trainer_name}) Hyperparameters ===\n")
-            for k, v in vars(self.cfg).items():
-                if k != "env_spec":
-                    f.write(f"{k:20s}: {v}\n")
-            f.write(f"{'env_id':20s}: {self.env_id_str}\n")
-            f.write(f"{'device':20s}: {self.device}\n")
-            f.write(f"{'run_dir':20s}: {self.run_dir}\n")
-        print(f"📝 Saved hyperparameters to {txt_path}")
 
-    def _update_batch(self, S, A, LOGP_OLD, ADV):
-        """Performs a GRPO update on a single batch of data."""
+    def _run_step_update(self, S, A, LOGP_OLD, ADV):
+        """
+        Performs a GRPO update on a single step's (G,) batch.
+        This is copied from the parent `_update` but simplified.
+        """
         S, A, LOGP_OLD, ADV = S.to(self.device), A.to(self.device), LOGP_OLD.to(self.device), ADV.to(self.device)
         
         total_clip = total_ent = total_kl = total_loss = 0.0
@@ -753,16 +812,11 @@ class TreeSearchGRPOTrainer:
                 n_updates += 1
 
         k = max(n_updates, 1)
-        return total_clip / k, total_kl / k, total_ent / k, total_loss / k
+        # We return the negative of L_clip to match the parent's loss sign
+        return -total_clip / k, total_kl / k, total_ent / k, -total_loss / k
 
-    def _adapt_beta(self, measured_kl: float):
-        if measured_kl > self.cfg.target_kl * 1.5:
-            self.cfg.beta_kl *= self.cfg.kl_adjust_up
-        elif measured_kl < self.cfg.target_kl / 1.5:
-            self.cfg.beta_kl *= self.cfg.kl_adjust_down
-        self.cfg.beta_kl = float(np.clip(self.cfg.beta_kl, 1e-4, 1.0))
-        
-    def _log_tb(self, avgR, stdR, kl, L_clip, L_ent, total_loss, ep_len, it_time):
+    def _log_tb_step(self, avgR, stdR, kl, L_clip, L_ent, total_loss, ep_len, it_time):
+        """ MCTS-specific logger for per-episode metrics """
         s = self.global_steps
         self.writer.add_scalar("episode/reward_avg", avgR, s)
         self.writer.add_scalar("episode/reward_std", stdR, s)
@@ -774,17 +828,22 @@ class TreeSearchGRPOTrainer:
         self.writer.add_scalar("loss/total", total_loss, s)
         self.writer.add_scalar("time/step_sec", it_time, s)
 
-    def train(self, num_episodes: int, 
+    # ===========================================
+    # == Main TreeSearch `train` loop (Overrides Base)
+    # ===========================================
+    def train(self, num_episodes: int,
+              eval_env: Optional[gym.Env] = None, # eval_env is unused, but kept for API consistency
+              eval_interval: int = 10,
+              eval_episodes: int = 100,
               video_dir: Optional[str] = None,
               video_fps: int = 30,
               video_format: str = "mp4",
               video_episodes: int = 6):
-        """
-        Main training loop. Runs for a fixed number of episodes.
-        """
-        pbar = tqdm(range(num_episodes), desc=f"MCTS-GRPO ({self.timestamp})", leave=True)
         
+        pbar = tqdm(range(num_episodes), desc=f"TreeSearchGRPO ({self.timestamp})", leave=True)
         all_episode_rewards = []
+        
+        self.main_env.reset(seed=self.master_seed)
         
         for ep_idx in pbar:
             s_obs, _ = self.main_env.reset(seed=self.master_seed)
@@ -793,13 +852,11 @@ class TreeSearchGRPOTrainer:
             ep_ret = 0.0
             t_start_ep = time.time()
             
-            # Store last metrics for logging
             L_kl, L_clip, L_ent, L_total = 0.0, 0.0, 0.0, 0.0
 
             while not ep_done:
                 t_start_step = time.time()
                 
-                # 1. Get current state and sample G actions
                 s_t_state = self.main_env.get_state()
                 s_t_tensor = torch.tensor(s_obs, dtype=torch.float32, device=self.device).unsqueeze(0)
                 
@@ -810,33 +867,33 @@ class TreeSearchGRPOTrainer:
                 
                 policy_state_cpu = {k: v.cpu() for k, v in self.pi.state_dict().items()}
 
-                # 2. Farm out rollouts to workers
                 worker_args = []
                 for i in range(self.cfg.G):
-                    worker_id = i % self.cfg.n_workers
+                    # worker_id = i % self.cfg.n_workers # <-- No longer needed
                     worker_args.append((
-                        worker_id, s_t_state, actions[i].item(), 
-                        policy_state_cpu, self.cfg.n_rollout_steps, self.cfg.gamma
+                        # worker_id,  <-- REMOVE THIS
+                        s_t_state, 
+                        actions[i].item(), 
+                        policy_state_cpu, 
+                        self.cfg.n_rollout_steps, 
+                        self.cfg.gamma
                     ))
                 
-                Returns = np.array(self.pool.starmap(_mcts_rollout_worker, worker_args))
+                # We expect cfg.G results, one for each action
+                Returns = np.array(self.pool.starmap(_treesearch_rollout_worker, worker_args))
                 
-                # 3. Calculate advantages
                 Returns_t = torch.tensor(Returns, dtype=torch.float32)
                 Adv = (Returns_t - Returns_t.mean()) / (Returns_t.std() + 1e-8)
                 
-                # 4. Perform policy update
                 S_batch = s_t_tensor.repeat(self.cfg.G, 1)
-                L_clip, L_kl, L_ent, L_total = self._update_batch(
+                L_clip, L_kl, L_ent, L_total = self._run_step_update(
                     S_batch, actions, log_probs, Adv
                 )
                 
-                # 5. Adapt KL beta
                 self._adapt_beta(L_kl)
                 if (self.global_steps + 1) % self.cfg.ref_update_freq == 0:
                     self.pi_ref.load_state_dict(self.pi.state_dict())
 
-                # 6. Take the best action in the main environment
                 best_action_idx = np.argmax(Returns)
                 best_action = actions[best_action_idx].item()
                 
@@ -849,12 +906,11 @@ class TreeSearchGRPOTrainer:
                 if self.cfg.verbose > 1:
                     print(f"  Step {ep_len}: R_mean={Returns.mean():.2f}, R_std={Returns.std():.2f}, Best_R={Returns.max():.2f}")
             
-            # --- End of Episode Logging ---
             t_end_ep = time.time()
             all_episode_rewards.append(ep_ret)
             avgR = np.mean(all_episode_rewards[-50:]) # 50-episode moving avg
             
-            self._log_tb(avgR, np.std(all_episode_rewards[-50:]), L_kl, L_clip, L_ent, L_total, ep_len, t_end_ep - t_start_ep)
+            self._log_tb_step(avgR, np.std(all_episode_rewards[-50:]), L_kl, L_clip, L_ent, L_total, ep_len, t_end_ep - t_start_ep)
             pbar.set_postfix(avgR=f"{avgR:.1f}", KL=f"{L_kl:.3f}", len=ep_len)
             
             if self.cfg.verbose > 0:
@@ -862,35 +918,47 @@ class TreeSearchGRPOTrainer:
                        f"| KL {L_kl:.4f} (β={self.cfg.beta_kl:.4g}) "
                        f"| Lclip {L_clip:.4f} Lent {L_ent:.4f} "
                        f"| steps {self.global_steps} | time {t_end_ep - t_start_ep:.2f}s")
+            
+            if (ep_idx + 1) % eval_interval == 0 and eval_env is not None:
+                print(f"\n--- Running evaluation at episode {ep_idx+1} ---")
+                results = evaluate_model(self.pi,
+                                         eval_env,
+                                         n_episodes=eval_episodes,
+                                         device=self.device,
+                                         num_workers=self.cfg.n_workers,
+                                         T=self.cfg.T,
+                                         disable_tqdm=True)
+                self.writer.add_scalar("eval/mean_reward", results["mean_reward"], self.global_steps)
+                if "success_rate" in results:
+                    self.writer.add_scalar("eval/success_rate", results["success_rate"], self.global_steps)
+                print(f"--- Evaluation complete: AvgR {results['mean_reward']:.2f} ---\n")
 
         print(f"✅ Training finished. Logs saved to {self.run_dir}")
         self.writer.flush()
         self.pool.close()
         self.pool.join()
         
-        # --- Final video recording ---
-        if video_dir and record_videos:
-            print("\n🏁 Recording final policy videos...")
-            video_path = (Path(video_dir) / f"{self._trainer_name}_G{self.cfg.G}_{self.timestamp}")
+        if video_dir is not None:
+            video_path = (Path(video_dir) / f"{self._trainer_name.lower()}_G{self.cfg.G}_{self.timestamp}")
+            print(f"🎥 Saving videos to {video_path}")
             record_videos(
                 policy=self.pi,
-                env=self.env_spec, 
+                env=self.env_spec,
                 video_dir=video_path,
                 episodes=video_episodes,
                 fps=video_fps,
                 device=self.device,
                 out_format=video_format,
-                T=1000 
+                T=self.cfg.T
             )
-            # Save hparams
-            txt_path = video_path / f"mcts_grpo_config_{self.timestamp}.txt"
+            txt_path = video_path / f"grpo_config_{self.timestamp}.txt"
             video_path.mkdir(parents=True, exist_ok=True)
             with open(txt_path, "w") as f:
                 f.write(f"=== GRPO ({self._trainer_name}) Hyperparameters ===\n")
                 for k, v in vars(self.cfg).items():
-                    if k != "env_spec":
+                    if k != "env":
                         f.write(f"{k:20s}: {v}\n")
-                f.write(f"{'env_id':20s}: {self.env_id_str}\n")  
+                f.write(f"{'env_id':20s}: {self.env_id_str}\n")
                 f.write(f"{'device':20s}: {self.device}\n")
                 f.write(f"{'video_dir':20s}: {video_path}\n")
             print(f"📝 Saved video run params to {txt_path}")

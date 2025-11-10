@@ -405,25 +405,29 @@ class StatefulLunarLander(DenseLunarLander):
     
     def get_state(self) -> Tuple[Any, Any, Any]:
         """
-        Saves the full physical and logical state of the environment.
+        Saves the full physical and logical state of the environment
+        into simple, pickle-able Python types.
         """
-        # 1. Save physics state for all dynamic bodies
+        # ✅ FIX: Convert Box2D b2Vec2 objects to plain tuples
         lander_state = (
-            self.lander.position.copy(),
+            (self.lander.position[0], self.lander.position[1]), # <-- Convert to tuple
             self.lander.angle,
-            self.lander.linearVelocity.copy(),
+            (self.lander.linearVelocity[0], self.lander.linearVelocity[1]), # <-- Convert to tuple
             self.lander.angularVelocity
         )
         legs_state = [
-            (leg.position.copy(), leg.angle, leg.linearVelocity.copy(), leg.angularVelocity)
+            (
+                (leg.position[0], leg.position[1]), # <-- Convert to tuple
+                leg.angle,
+                (leg.linearVelocity[0], leg.linearVelocity[1]), # <-- Convert to tuple
+                leg.angularVelocity
+            )
             for leg in self.legs
         ]
         
-        # 2. Save game logic state
         game_state = (
             self.game_over,
             self.prev_shaping,
-            # Save wind state (if used)
             getattr(self, 'wind_idx', 0),
             getattr(self, 'torque_idx', 0)
         )
@@ -435,23 +439,24 @@ class StatefulLunarLander(DenseLunarLander):
         """
         lander_state, legs_state, game_state = state
         
-        # 1. Restore physics state
-        pos, angle, lin_vel, ang_vel = lander_state
-        self.lander.position = pos
+        # ✅ FIX: Box2D properties are read-only, so we must set them
+        #      using their .Set() method or by assigning a new tuple/list.
+        
+        pos_tuple, angle, lin_vel_tuple, ang_vel = lander_state
+        self.lander.position = pos_tuple
         self.lander.angle = angle
-        self.lander.linearVelocity = lin_vel
+        self.lander.linearVelocity = lin_vel_tuple
         self.lander.angularVelocity = ang_vel
-        self.lander.awake = True # Wake up the body
+        self.lander.awake = True
 
         for i, leg_state in enumerate(legs_state):
-            pos, angle, lin_vel, ang_vel = leg_state
-            self.legs[i].position = pos
+            pos_tuple, angle, lin_vel_tuple, ang_vel = leg_state
+            self.legs[i].position = pos_tuple
             self.legs[i].angle = angle
-            self.legs[i].linearVelocity = lin_vel
+            self.legs[i].linearVelocity = lin_vel_tuple
             self.legs[i].angularVelocity = ang_vel
             self.legs[i].awake = True
 
-        # 2. Restore game logic state
         (self.game_over, self.prev_shaping, 
          wind_idx, torque_idx) = game_state
         
