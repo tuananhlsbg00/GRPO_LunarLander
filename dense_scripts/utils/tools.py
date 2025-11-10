@@ -30,22 +30,27 @@ def record_videos(
     """
     Path(video_dir).mkdir(parents=True, exist_ok=True)
 
-    # --- Build environment instance safely ---
+    # --- Create or prepare the environment ---
     if isinstance(env, str):
+        # If a string ID, build the env with RGB rendering
         env_instance = gym.make(env, render_mode="rgb_array")
         env_name = env
-    elif isinstance(env, tuple):
-        # (class, kwargs)
-        cls, kwargs = env
-        env_instance = cls(**kwargs)
-        env_instance.render_mode = "rgb_array"
-        env_name = cls.__name__
     elif hasattr(env, "reset"):
+        # If it's already an environment instance
         env_instance = env
-        env_name = getattr(env, "spec", None)
-        env_name = env_name.id if env_name else env.__class__.__name__
+        env_name = getattr(env_instance, "spec", None)
+        env_name = env_name.id if env_name else env_instance.__class__.__name__
+
+        # ✅ Ensure render_mode is set for proper video rendering
+        if not hasattr(env_instance, "render_mode") or env_instance.render_mode != "rgb_array":
+            try:
+                env_instance.render_mode = "rgb_array"
+            except Exception:
+                pass
     else:
-        raise TypeError(f"Unsupported env type: {type(env)}")
+        raise TypeError(
+            f"Unsupported env type: {type(env)}. Expected str or gym.Env instance."
+        )
 
     print(f"🎥 Recording {episodes} episodes from {env_name}...")
 

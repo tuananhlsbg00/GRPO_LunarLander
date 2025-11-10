@@ -378,7 +378,8 @@ class PPOTrainer:
                 )
 
         if video_dir and record_videos:
-            self._record_videos(video_dir, video_episodes, video_fps, video_format)
+            self._record_videos(video_dir, video_episodes, video_fps, video_format, eval_env=eval_env)
+
 
         self.close()
         return self.pi, self.v
@@ -528,7 +529,12 @@ class PPOTrainer:
         self.writer.add_scalar("train/clip_fraction", logs["clipfrac"], s)
         self.writer.add_scalar("time/iter_sec", it_time, s)
 
-    def _record_videos(self, video_dir, episodes, fps, fmt):
+    def _record_videos(self, video_dir, episodes, fps, fmt, eval_env=None):
+        """
+        Record rollout videos using either the provided eval_env, the cfg.env (if it's an environment instance),
+        or fall back to env_spec (string or tuple). This ensures that custom environments like DenseLunarLander
+        are used correctly for visualization.
+        """
         out_dir = Path(video_dir) / f"ppo_G{self.cfg.G}_γ{self.cfg.gamma}_{self.timestamp}"
         out_dir.mkdir(parents=True, exist_ok=True)
         print(f"🎥 Recording PPO evaluation videos to {out_dir}")
@@ -537,9 +543,20 @@ class PPOTrainer:
             print("⚠️ 'record_videos' utility not available; skipping video recording.")
             return
 
+        # --- Choose environment for video recording ---
+        if eval_env is not None:
+            video_env = eval_env
+        elif hasattr(self.cfg, "env") and hasattr(self.cfg.env, "reset"):
+            # User passed in a real env object in PPOConfig.env
+            video_env = self.cfg.env
+        else:
+            # Fall back to spec string or tuple
+            video_env = self.env_spec
+
+        # --- Record videos ---
         record_videos(
-            self.pi,
-            self.env_spec,
+            policy=self.pi,
+            env=video_env,
             video_dir=out_dir,
             episodes=episodes,
             fps=fps,
@@ -548,7 +565,7 @@ class PPOTrainer:
             T=self.cfg.T,
         )
 
-        # Save run metadata
+        # --- Save run metadata ---
         txt_path = out_dir / f"ppo_{self.timestamp}.txt"
         with open(txt_path, "w") as f:
             f.write("=== PPO Run Parameters (Video Export) ===\n")
@@ -559,6 +576,7 @@ class PPOTrainer:
             f.write(f"{'device':20s}: {self.device}\n")
             f.write(f"{'video_dir':20s}: {out_dir}\n")
         print(f"📝 Saved video parameters to {txt_path}")
+
 
 
     def _save_hparams(self):
