@@ -37,3 +37,6 @@ events.out.tfevents.*
 
 # Ignore notebook checkpoints
 .ipynb_checkpoints/
+
+
+TestScripts.ipynb

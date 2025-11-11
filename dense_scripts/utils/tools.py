@@ -5,6 +5,11 @@ import numpy as np
 from pathlib import Path
 import imageio.v2 as imageio
 
+import os
+import re
+from datetime import datetime
+from IPython.display import Image, display
+
 
 from tqdm import tqdm
 from typing import Optional, Dict, Any, Tuple, List, Type, Union
@@ -70,7 +75,7 @@ def record_videos(
                     dist = policy.policy.dist(obs_t)
                 else:
                     dist = policy.dist(obs_t)
-                action = dist.probs.argmax(dim=-1).item()  # greedy
+                action = dist.sample().item()  # random
             obs, reward, done, truncated, _ = env_instance.step(action)
             total_reward += reward
             frame = env_instance.render()
@@ -241,3 +246,51 @@ def evaluate_model(
     )
     return stats
 
+def get_latest_folder(base_dir):
+    pattern = r"hybrid_G\d+_(\d{2}h\d{2})_(\d{8})"
+    latest_time = None
+    latest_folder = None
+
+    for folder in os.listdir(base_dir):
+        match = re.match(pattern, folder)
+        if match:
+            hour_str = match.group(1).replace("h", ":")
+            date_str = match.group(2)
+            dt_str = f"{date_str} {hour_str}"  # e.g., "11112025 09:51"
+            dt = datetime.strptime(dt_str, "%d%m%Y %H:%M")
+            if latest_time is None or dt > latest_time:
+                latest_time = dt
+                latest_folder = folder
+
+    if latest_folder:
+        return os.path.join(base_dir, latest_folder)
+    return None
+
+def get_best_reward_gif(folder_path):
+    reward_pattern = r"R(-?\d+\.\d+)\.gif"
+    best_reward = float("-inf")
+    best_gif = None
+
+    for filename in os.listdir(folder_path):
+        match = re.search(reward_pattern, filename)
+        if match:
+            reward = float(match.group(1))
+            if reward > best_reward:
+                best_reward = reward
+                best_gif = filename
+
+    if best_gif:
+        return os.path.join(folder_path, best_gif)
+    return None
+
+def show_output_gif(base_dir):
+    latest_folder_path = get_latest_folder(base_dir)
+    if latest_folder_path:
+        best_gif_path = get_best_reward_gif(latest_folder_path)
+        if best_gif_path:
+            print(f"Best reward GIF found in {latest_folder_path}:", best_gif_path)
+            display(Image(filename=best_gif_path))
+        else:
+            print("No GIF found in latest folder.")
+    else:
+        print("No matching folder found.")
